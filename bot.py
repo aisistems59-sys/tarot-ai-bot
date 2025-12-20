@@ -70,6 +70,9 @@ PROMO_CODES: Dict[str, int] = {
     "ALTAR2FW8": 1,
 }
 
+# Глобальный список уже использованных промокодов (на всех пользователей, пока бот работает)
+USED_PROMO_CODES: set[str] = set()
+
 # ==================================================
 # ПОЛНАЯ КОЛОДА ТАРО (78 КАРТ) С ПУТЯМИ К КАРТИНКАМ
 # ==================================================
@@ -207,6 +210,12 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        # Чтобы не было 501 на health-check методом HEAD
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
 
 
 def run_health_server():
@@ -416,16 +425,7 @@ async def promo_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code_raw = update.message.text.strip()
     code = code_raw.upper()
 
-    used_codes = context.user_data.get("used_promos", [])
-    balance = context.user_data.get("credits", 0)
-
-    if code in used_codes:
-        await update.message.reply_text(
-            "Этот промокод уже был использован. Для нового сеанса понадобится другой код.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
+    # 1) Проверяем, существует ли вообще такой код
     if code not in PROMO_CODES:
         await update.message.reply_text(
             "Колода промокодов молчит на этот набор символов.\n"
@@ -434,12 +434,35 @@ async def promo_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    # 2) Проверяем, не был ли уже использован этот код глобально
+    if code in USED_PROMO_CODES:
+        await update.message.reply_text(
+            "Этот промокод уже исчерпал свою силу и больше не активен 🔒\n"
+            "Можно попросить другой код или воспользоваться оплатой Stars.",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
+    # 3) Проверяем, не использовал ли уже этот код конкретный пользователь
+    used_codes = context.user_data.get("used_promos", [])
+    balance = context.user_data.get("credits", 0)
+
+    if code in used_codes:
+        await update.message.reply_text(
+            "Этот промокод уже был активирован в твоём профиле.\n"
+            "Для нового сеанса понадобится другой код.",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
+    # --- Всё ок, активируем код ---
     plus = PROMO_CODES[code]
     balance += plus
     used_codes.append(code)
 
     context.user_data["credits"] = balance
     context.user_data["used_promos"] = used_codes
+    USED_PROMO_CODES.add(code)
 
     await update.message.reply_text(
         "Промокод принят 🔑\n"
