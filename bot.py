@@ -3,6 +3,9 @@ import asyncio
 import random
 from typing import List, Dict
 
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
@@ -193,7 +196,26 @@ MAIN_MENU = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
-# ... (всё остальное в файле оставляешь БЕЗ изменений, как у тебя уже есть)
+
+# ================== ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER ==================
+
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Простейший ответ для проверки Render'ом
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+
+def run_health_server():
+    # Render передаёт порт в переменной PORT
+    port = int(os.environ.get("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"HTTP health server listening on port {port}")
+    server.serve_forever()
+
 
 def build_draw_keyboard(cards_drawn: int) -> ReplyKeyboardMarkup:
     """Клавиатура во время расклада с нужными подписями."""
@@ -654,6 +676,12 @@ async def reading_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+
+    # Запускаем HTTP health-сервер для Render в отдельном потоке
+    threading.Thread(target=run_health_server, daemon=True).start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
@@ -713,7 +741,7 @@ def main():
     )
     app.add_handler(reading_conv)
 
-    print("Бот запущен. Нажми Ctrl+C в терминале, чтобы остановить.")
+    print("Бот запущен.")
     app.run_polling()
 
 
