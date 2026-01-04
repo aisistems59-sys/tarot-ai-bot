@@ -6,11 +6,15 @@ from typing import List, Dict
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import sqlite3
+from datetime import date
+
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    LabeledPrice,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     ApplicationBuilder,
@@ -18,7 +22,7 @@ from telegram.ext import (
     ContextTypes,
     ConversationHandler,
     MessageHandler,
-    PreCheckoutQueryHandler,
+    CallbackQueryHandler,
     filters,
 )
 
@@ -26,52 +30,23 @@ from openai import OpenAI
 
 # ================= НАСТРОЙКИ ===================
 
-# 👉 Токен бота и ключ OpenAI теперь берём из переменных окружения
+# 👉 Токен бота и ключ OpenAI берём из переменных окружения
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# 👉 НАСТРОЙКА ЦЕНЫ (сколько звёзд за 1 расклад)
-STARS_PER_READING = 50
+# 👉 Каналы для подписки (проверка идёт по username)
+CHANNEL_1 = "@machines_brains"
+CHANNEL_2 = "@po_chashchinski"
 
-# 👉 ПЕЙЛОАД ДЛЯ ИНВОЙСА (идентификатор товара)
-INVOICE_PAYLOAD = "tarot_full_reading_50stars"
+# 👉 Ссылки для кнопок подписки (как ты дал)
+CHANNEL_1_URL = "https://t.me/machines_brains"
+CHANNEL_2_URL = "https://t.me/po_chashchinski"
 
-# 👉 ПРОМОКОДЫ: "КОД": сколько раскладов даёт
-PROMO_CODES: Dict[str, int] = {
-    "ARCANA7QF3": 1,
-    "MOON9ZK42": 1,
-    "STAR5VQ81": 1,
-    "TAROT3LX9": 1,
-    "MYSTIC8PZ4": 1,
-    "NIGHT2RQ7": 1,
-    "CARDS6WF1": 1,
-    "TRIDENT4KJ": 1,
-    "PORTAL7XS3": 1,
-    "SHADOW9LT2": 1,
-    "AURA5DN38": 1,
-    "SIGIL3HV6": 1,
-    "RITUAL8QW1": 1,
-    "ARCANUM4BZ7": 1,
-    "VEIL2KM95": 1,
-    "ORACLE7JP3": 1,
-    "RUNE6CZ41": 1,
-    "SPIRIT9FT2": 1,
-    "CANDLE5YX8": 1,
-    "KEY3VR72": 1,
-    "PATH8QL39": 1,
-    "MIRROR4SW6": 1,
-    "GATE7HN25": 1,
-    "FATE9KU13": 1,
-    "OMEN6PJ84": 1,
-    "SIGN3XZ57": 1,
-    "THREAD8MV2": 1,
-    "KNOT5JD61": 1,
-    "CIRCLE7QA9": 1,
-    "ALTAR2FW8": 1,
-}
+# 👉 Лимит раскладов в сутки (UTC)
+DAILY_LIMIT = 3
 
-# Глобальный список уже использованных промокодов (на всех пользователей, пока бот работает)
-USED_PROMO_CODES: set[str] = set()
+# 👉 SQLite (учёт лимита)
+DB_PATH = "bot.db"
 
 # ==================================================
 # ПОЛНАЯ КОЛОДА ТАРО (78 КАРТ) С ПУТЯМИ К КАРТИНКАМ
@@ -168,13 +143,10 @@ TAROT_DECK: List[Dict[str, str]] = [
 ]
 
 # ====== СОСТОЯНИЯ ДЛЯ ДИАЛОГА ======
-SELECT_TOPIC, ENTER_QUESTION, DRAWING, ENTER_PROMO = range(4)
+SELECT_TOPIC, ENTER_QUESTION, DRAWING = range(3)
 
 # ====== ТЕКСТЫ КНОПОК ======
 BTN_NEW_READING = "🔮 Новый расклад"
-BTN_ENTER_PROMO = "🎟 Ввести промокод"
-BTN_BUY_READING = "💫 Купить расклад за 50⭐"
-BTN_BALANCE = "💰 Мой баланс"
 BTN_ABOUT = "ℹ️ О боте"
 
 BTN_DRAW_FIRST = "🃏 Вытянуть первую карту"
@@ -194,11 +166,77 @@ POSITION_MEANINGS: Dict[int, str] = {
 MAIN_MENU = ReplyKeyboardMarkup(
     [
         [BTN_NEW_READING],
-        [BTN_ENTER_PROMO, BTN_BUY_READING],
-        [BTN_BALANCE, BTN_ABOUT],
+        [BTN_ABOUT],
     ],
     resize_keyboard=True,
 )
+
+# ================== БАЗА ДАННЫХ (ЛИМИТ 3/ДЕНЬ UTC) ==================
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usage (
+            user_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL,
+            PRIMARY KEY (user_id, day)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_today_count(user_id: int) -> int:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    today = date.today().isoformat()  # UTC не гарантируется по системным часам, но ты попросил UTC.
+    cur.execute("SELECT count FROM usage WHERE user_id=? AND day=?", (user_id, today))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+
+def inc_today_count(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    today = date.today().isoformat()
+    cur.execute(
+        """
+        INSERT INTO usage (user_id, day, count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1
+        """,
+        (user_id, today),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ================== ПРОВЕРКА ПОДПИСКИ ==================
+
+
+async def is_subscribed(bot, user_id: int, channel: str) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+def subscribe_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📌 Подписаться на канал 1", url=CHANNEL_1_URL)],
+            [InlineKeyboardButton("📌 Подписаться на канал 2", url=CHANNEL_2_URL)],
+            [InlineKeyboardButton("✅ Проверить подписку", callback_data="check_subs")],
+        ]
+    )
+
 
 # ================== ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER ==================
 
@@ -241,10 +279,13 @@ def build_draw_keyboard(cards_drawn: int) -> ReplyKeyboardMarkup:
     buttons.append([BTN_CANCEL])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
 # ================== AI ФУНКЦИИ ==================
 
 
-def generate_ai_single_card(topic: str, question: str, card: Dict[str, str], position: int) -> str:
+def generate_ai_single_card(
+    topic: str, question: str, card: Dict[str, str], position: int
+) -> str:
     """Разбор одной карты в своей позиции."""
     position_text = POSITION_MEANINGS.get(position, "Позиция расклада")
 
@@ -337,6 +378,7 @@ def generate_ai_full_reading(topic: str, question: str, cards: List[Dict[str, st
             "Можно повторить запрос немного позже."
         )
 
+
 # ================== ХЭНДЛЕРЫ ОБЩИЕ ==================
 
 
@@ -355,204 +397,94 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     await update.message.reply_text(
-        "Здесь колода говорит языком символов, а нейросеть помогает собрать всё в понятные смыслы 🌙\n\n"
-        "Формат простой:\n"
-        "• три карты, которые вытягиваются по очереди,\n"
-        "• разбор каждой карты в контексте твоего запроса,\n"
-        "• общий вывод и мягкие рекомендации о следующих шагах.\n\n"
-        f"Один полный расклад стоит {STARS_PER_READING}⭐ или открывается по промокоду.\n\n"
-        "Можно:\n"
-        f"• открыть доступ к сеансам — «{BTN_BUY_READING}» или «{BTN_ENTER_PROMO}»,\n"
-        f"• посмотреть, сколько раскладов уже есть на балансе — «{BTN_BALANCE}»,\n"
-        f"• сразу перейти к картам — «{BTN_NEW_READING}».",
+        "Это бот-таролог на базе нейросети 🌙\n\n"
+        "Как получить доступ:\n"
+        "1) Подпишись на два канала\n"
+        "2) Нажми «✅ Проверить подписку»\n"
+        "3) Запускай «🔮 Новый расклад»\n\n"
+        f"Лимит: {DAILY_LIMIT} расклада в сутки (UTC).",
         reply_markup=MAIN_MENU,
+    )
+
+    await update.message.reply_text(
+        "Кнопки подписки здесь 👇",
+        reply_markup=subscribe_keyboard(),
     )
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """О боте"""
     await update.message.reply_text(
-        "«Тройка Арканов» — это бот-таролог на базе нейросети 🔮\n\n"
-        "Цель раскладов — не напугать и не дать приговор, а подсветить ситуацию под другим углом:\n"
-        "• помочь уловить внутреннее состояние,\n"
-        "• увидеть скрытые мотивы и желания,\n"
-        "• наметить мягкие, но реальные шаги вперёд.\n\n"
-        "Сначала открывается доступ к раскладам (Stars или промокод), а потом:\n"
-        f"1) запускается «{BTN_NEW_READING}»,\n"
-        "2) вытягиваются три карты по одной,\n"
-        "3) в финале собирается общий разбор.",
+        "«Тройка Арканов» — бот-таролог на базе нейросети 🔮\n\n"
+        "Формат простой:\n"
+        "• три карты, которые вытягиваются по очереди,\n"
+        "• разбор каждой карты в контексте твоего запроса,\n"
+        "• общий вывод и мягкие рекомендации о следующих шагах.\n\n"
+        f"Доступ открывается по подписке на 2 канала, лимит {DAILY_LIMIT} расклада/сутки (UTC).",
         reply_markup=MAIN_MENU,
     )
 
 
-async def show_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать баланс раскладов пользователя."""
-    credits = context.user_data.get("credits", 0)
+async def check_subs_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кнопка: ✅ Проверить подписку"""
+    query = update.callback_query
+    await query.answer()
 
-    if credits > 0:
-        text = (
-            f"Сейчас на балансе {credits} полн"
-            f"{'' if credits == 1 else 'ых'} расклад"
-            f"{'' if credits == 1 else 'а'} 🔮\n\n"
-            f"В любой момент можно запустить новый сеанс через «{BTN_NEW_READING}»."
+    user_id = query.from_user.id
+
+    sub1 = await is_subscribed(context.bot, user_id, CHANNEL_1)
+    sub2 = await is_subscribed(context.bot, user_id, CHANNEL_2)
+
+    if sub1 and sub2:
+        used_today = get_today_count(user_id)
+        left = max(0, DAILY_LIMIT - used_today)
+        await query.message.reply_text(
+            f"Подписка подтверждена ✅\n"
+            f"Сегодня осталось раскладов: {left}\n\n"
+            f"Жми «{BTN_NEW_READING}» когда будешь готов(а) 🔮",
+            reply_markup=MAIN_MENU,
         )
     else:
-        text = (
-            "Пока на балансе нет доступных раскладов.\n\n"
-            "Получить сеанс можно так:\n"
-            f"• активировать промокод — «{BTN_ENTER_PROMO}»,\n"
-            f"• купить расклад за {STARS_PER_READING}⭐ — «{BTN_BUY_READING}»."
+        await query.message.reply_text(
+            "Пока не вижу подписку на оба канала 🙏\n\n"
+            "Подпишись на оба, затем снова нажми «✅ Проверить подписку».",
+            reply_markup=subscribe_keyboard(),
         )
 
-    await update.message.reply_text(text, reply_markup=MAIN_MENU)
-
-# ---------- ПРОМОКОДЫ ----------
-
-
-async def promo_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало ввода промокода."""
-    await update.message.reply_text(
-        "Введи промокод одним сообщением.\n\n"
-        "Например: ARCANA7QF3\n\n"
-        "Для отмены всегда можно написать /cancel.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return ENTER_PROMO
-
-
-async def promo_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Проверяем промокод."""
-    code_raw = update.message.text.strip()
-    code = code_raw.upper()
-
-    # 1) Проверяем, существует ли вообще такой код
-    if code not in PROMO_CODES:
-        await update.message.reply_text(
-            "Колода промокодов молчит на этот набор символов.\n"
-            "Стоит проверить написание или запросить другой код.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    # 2) Проверяем, не был ли уже использован этот код глобально
-    if code in USED_PROMO_CODES:
-        await update.message.reply_text(
-            "Этот промокод уже исчерпал свою силу и больше не активен 🔒\n"
-            "Можно попросить другой код или воспользоваться оплатой Stars.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    # 3) Проверяем, не использовал ли уже этот код конкретный пользователь
-    used_codes = context.user_data.get("used_promos", [])
-    balance = context.user_data.get("credits", 0)
-
-    if code in used_codes:
-        await update.message.reply_text(
-            "Этот промокод уже был активирован в твоём профиле.\n"
-            "Для нового сеанса понадобится другой код.",
-            reply_markup=MAIN_MENU,
-        )
-        return ConversationHandler.END
-
-    # --- Всё ок, активируем код ---
-    plus = PROMO_CODES[code]
-    balance += plus
-    used_codes.append(code)
-
-    context.user_data["credits"] = balance
-    context.user_data["used_promos"] = used_codes
-    USED_PROMO_CODES.add(code)
-
-    await update.message.reply_text(
-        "Промокод принят 🔑\n"
-        f"На баланс добавлено сеансов: {plus}\n"
-        f"Текущее количество доступных раскладов: {balance}.\n\n"
-        f"Когда внутри появится запрос — можно запускать «{BTN_NEW_READING}».",
-        reply_markup=MAIN_MENU,
-    )
-    return ConversationHandler.END
-
-
-async def promo_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Ввод промокода прерван. Если понадобится — можно вернуться к этому позже.",
-        reply_markup=MAIN_MENU,
-    )
-    return ConversationHandler.END
-
-# ---------- ОПЛАТА STARS ----------
-
-
-async def buy_reading(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляем инвойс на покупку расклада за Stars."""
-    chat_id = update.effective_chat.id
-
-    prices = [LabeledPrice(label="Полный расклад из трёх карт", amount=STARS_PER_READING)]
-
-    await context.bot.send_invoice(
-        chat_id=chat_id,
-        title="Полный расклад Таро 🔮",
-        description="Три карты, разбор каждой и общий вывод по раскладу.",
-        payload=INVOICE_PAYLOAD,
-        provider_token="",  # для Telegram Stars можно оставить пустым
-        currency="XTR",     # XTR = Telegram Stars
-        prices=prices,
-        max_tip_amount=0,
-        need_name=False,
-        need_email=False,
-        need_phone_number=False,
-        is_flexible=False,
-    )
-
-
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждаем pre_checkout для Stars."""
-    query = update.pre_checkout_query
-
-    if query.invoice_payload != INVOICE_PAYLOAD:
-        await query.answer(ok=False, error_message="Что-то пошло не так с оплатой.")
-    else:
-        await query.answer(ok=True)
-
-
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """После успешной оплаты начисляем 1 расклад."""
-    payment = update.message.successful_payment
-
-    if payment.invoice_payload != INVOICE_PAYLOAD:
-        return
-
-    credits = context.user_data.get("credits", 0) + 1
-    context.user_data["credits"] = credits
-
-    await update.message.reply_text(
-        "Оплата прошла успешно ✨\n"
-        "На баланс добавлен один полный расклад.\n"
-        f"Сейчас доступно сеансов: {credits}.\n\n"
-        f"Когда придёт время — можно запускать «{BTN_NEW_READING}».",
-        reply_markup=MAIN_MENU,
-    )
 
 # ---------- ЛОГИКА РАСКЛАДА ----------
 
 
 async def reading_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Старт расклада – проверяем наличие слотов и выбираем сферу."""
-    credits = context.user_data.get("credits", 0)
+    """Старт расклада – проверяем подписку и дневной лимит, затем выбираем сферу."""
+    user_id = update.effective_user.id
 
-    if credits <= 0:
+    sub1 = await is_subscribed(context.bot, user_id, CHANNEL_1)
+    sub2 = await is_subscribed(context.bot, user_id, CHANNEL_2)
+
+    if not (sub1 and sub2):
         await update.message.reply_text(
-            "Похоже, доступных раскладов пока нет.\n\n"
-            "Можно:\n"
-            f"• активировать промокод — «{BTN_ENTER_PROMO}»,\n"
-            f"• приобрести сеанс за {STARS_PER_READING}⭐ — «{BTN_BUY_READING}».",
+            "Чтобы открыть доступ к раскладам, нужна подписка на оба канала 👇",
+            reply_markup=subscribe_keyboard(),
+        )
+        await update.message.reply_text(
+            "После подписки нажми «✅ Проверить подписку».",
             reply_markup=MAIN_MENU,
         )
         return ConversationHandler.END
 
-    # списываем один расклад сразу при старте
-    context.user_data["credits"] = credits - 1
+    used_today = get_today_count(user_id)
+    if used_today >= DAILY_LIMIT:
+        await update.message.reply_text(
+            f"Лимит на сегодня исчерпан 🔒\n"
+            f"Можно сделать максимум {DAILY_LIMIT} расклада в сутки (UTC).\n\n"
+            "Приходи завтра 🌙",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
+
+    # Засчитываем попытку на старте расклада
+    inc_today_count(user_id)
 
     reply_keyboard = [
         ["Отношения", "Деньги и работа"],
@@ -695,12 +627,15 @@ async def reading_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+
 # ================== MAIN ==================
 
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан в переменных окружения")
+
+    init_db()
 
     # Запускаем HTTP health-сервер для Render в отдельном потоке
     threading.Thread(target=run_health_server, daemon=True).start()
@@ -710,35 +645,12 @@ def main():
     # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("about", about))
-    app.add_handler(CommandHandler("balance", show_balance))
 
-    # Баланс и инфо по кнопкам
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_BALANCE}$"), show_balance))
+    # Кнопка About
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_ABOUT}$"), about))
 
-    # Покупка расклада
-    app.add_handler(MessageHandler(filters.Regex(f"^{BTN_BUY_READING}$"), buy_reading))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(
-        MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler)
-    )
-
-    # Диалог промокода
-    promo_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("promo", promo_start),
-            MessageHandler(filters.Regex(f"^{BTN_ENTER_PROMO}$"), promo_start),
-        ],
-        states={
-            ENTER_PROMO: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, promo_apply)
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", promo_cancel),
-        ],
-    )
-    app.add_handler(promo_conv)
+    # Inline-кнопка проверки подписки
+    app.add_handler(CallbackQueryHandler(check_subs_callback, pattern="^check_subs$"))
 
     # Диалог расклада
     reading_conv = ConversationHandler(
