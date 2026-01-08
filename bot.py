@@ -42,7 +42,7 @@ CHANNEL_1 = "@machines_brains"
 CHANNEL_2 = "@po_chashchinski"
 
 # 👉 Ссылки для кнопок подписки
-CHANNEL_1_URL = "https://t.me/machines_brains"
+CHANNEL_1_URL = "https://t.me/newshiftspace"
 CHANNEL_2_URL = "https://t.me/po_chashchinski"
 
 # 👉 Лимит раскладов в сутки (UTC)
